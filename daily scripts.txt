@@ -1,0 +1,12 @@
+# Activar entorno (siempre al empezar a trabajar)
+venv\Scripts\Activate.ps1
+
+# Arrancar servidor en desarrollo
+uvicorn app.main:app --reload --port 8000
+
+# Instalar nueva dependencia
+pip install nombre-paquete
+pip freeze > requirements.txt   # actualizar el lockfile
+
+# Desactivar entorno al terminar
+deactivate
