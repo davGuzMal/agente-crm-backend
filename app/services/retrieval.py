@@ -20,6 +20,7 @@ Nota sobre async:
 
 import logging
 from typing import List, Optional
+from uuid import UUID
 
 from supabase import create_client, Client
 
@@ -321,7 +322,7 @@ def load_crm_candidates(profile: IntakeProfile) -> List[CRMCandidate]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def search_semantic_context(
-    crm_ids: List[str],
+    crm_ids: List[UUID],
     profile: IntakeProfile,
     top_k: int = 5,
 ) -> List[dict]:
@@ -361,7 +362,7 @@ def search_semantic_context(
             "match_crm_chunks",
             {
                 "query_embedding": embedding,
-                "match_crm_ids":   crm_ids,
+                "filter_crm_id":   crm_ids,
                 "match_count":     top_k,
             },
         ).execute()

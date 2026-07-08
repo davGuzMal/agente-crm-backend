@@ -1,25 +1,25 @@
 """
 app/services/llm.py
 ───────────────────
-Módulo de llamada a Claude con streaming SSE para la generación del veredicto.
+Módulo de llamada a Claude con streaming SSE estructurado.
 
-El LLM NO calcula rankings — recibe el ScoringOutput ya calculado por el
-backend y lo interpreta en lenguaje natural en 6 secciones estructuradas.
+La novedad respecto al esqueleto anterior: el StreamParser actúa como
+máquina de estados sobre los tokens de Claude. Detecta las etiquetas
+de sección ([VEREDICTO], [RANKING]…) aunque lleguen fragmentadas en
+múltiples tokens, y emite eventos SSE estructurados.
 
-Flujo:
-  1. build_user_message()  → serializa ScoringOutput + perfil a texto estructurado
-  2. stream_verdict()       → llama a Claude con stream=True y emite SSE tokens
-  3. El router convierte el generator en StreamingResponse (text/event-stream)
+El frontend recibe eventos tipados y nunca necesita escanear strings:
 
-Formato SSE emitido:
-  data: {"token": "texto parcial"}\n\n   ← tokens de Claude
-  data: {"type": "done"}\n\n             ← fin del stream
-  data: {"type": "error", ...}\n\n       ← error recuperable
+  {"type": "metadata",      ...}           ← ranking pre-calculado (de evaluate.py)
+  {"type": "section_start", "section": X}  ← inicio de sección detectado
+  {"type": "token",  "section": X, "content": "..."}  ← fragmento de texto
+  {"type": "done",   "sections_completed": [...]}      ← stream finalizado
+  {"type": "error",  "code": "E02", "message": "..."}  ← error recuperable
 """
 
 import json
 import logging
-from typing import AsyncGenerator, List
+from typing import AsyncGenerator, List, Optional
 
 import anthropic
 
@@ -30,20 +30,176 @@ from app.services.filter import ExclusionResult
 
 logger = logging.getLogger(__name__)
 
-# ── Cliente Anthropic (singleton por módulo) ──────────────────────────────────
 _client = anthropic.AsyncAnthropic(
     api_key=settings.anthropic_api_key,
     timeout=45.0,
 )
 
-# ── Parámetros del modelo ─────────────────────────────────────────────────────
-MODEL         = "claude-sonnet-4-6"
-MAX_TOKENS    = 1800
-TEMPERATURE   = 0.3
+MODEL      = "claude-sonnet-4-6"
+MAX_TOKENS = 1800
+TEMPERATURE = 0.3
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SYSTEM PROMPT — definido por rol, no por estructura de datos
+# SECCIONES CONOCIDAS Y TAGS
+# ══════════════════════════════════════════════════════════════════════════════
+
+KNOWN_SECTIONS = [
+    "VEREDICTO",
+    "RANKING",
+    "ANALISIS_GANADOR",
+    "ALTERNATIVA",
+    "ALERTAS",
+    "CONFIANZA",
+]
+
+# Tags completos que Claude emitirá: [VEREDICTO], [RANKING], etc.
+SECTION_TAGS = {f"[{s}]" for s in KNOWN_SECTIONS}
+
+# Longitud máxima de cualquier tag (para decidir cuándo dejar de esperar)
+MAX_TAG_LEN = max(len(t) for t in SECTION_TAGS)   # 18 → "[ANALISIS_GANADOR]"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MÁQUINA DE ESTADOS: StreamParser
+# ══════════════════════════════════════════════════════════════════════════════
+
+class StreamParser:
+    """
+    Parsea el stream de tokens de Claude y emite eventos estructurados.
+
+    Problema: una etiqueta como [VEREDICTO] puede llegar fragmentada:
+      token 1 → "[VERED"
+      token 2 → "ICTO]\n"
+
+    Solución: buffer acumulativo + búsqueda de tags completos en cada feed().
+    Mientras el buffer podría ser el inicio de un tag conocido, lo retiene.
+    En cuanto confirma que no lo es, emite todo como contenido.
+
+    Uso:
+        parser = StreamParser()
+        for raw_token in claude_stream:
+            for event in parser.feed(raw_token):
+                yield sse(event)
+        for event in parser.flush():
+            yield sse(event)
+    """
+
+    def __init__(self):
+        self.buffer: str = ""
+        self.current_section: Optional[str] = None
+        self.sections_completed: List[str] = []
+
+    # ── API pública ───────────────────────────────────────────────────────────
+
+    def feed(self, token: str) -> List[dict]:
+        """
+        Ingesta un token y devuelve los eventos SSE que deben emitirse ahora.
+        Puede devolver cero, uno o varios eventos por token.
+        """
+        self.buffer += token
+        return self._drain()
+
+    def flush(self) -> List[dict]:
+        """
+        Vacía el buffer al final del stream.
+        Emite cualquier contenido retenido como contenido de la sección activa.
+        """
+        events = []
+        if self.buffer.strip():
+            events += self._content_events(self.buffer)
+        # Cerrar la última sección abierta si no está ya en completed
+        if self.current_section and self.current_section not in self.sections_completed:
+            self.sections_completed.append(self.current_section)
+        self.buffer = ""
+        return events
+
+    # ── Lógica interna ────────────────────────────────────────────────────────
+
+    def _drain(self) -> List[dict]:
+        """
+        Procesa el buffer en bucle hasta que no haya más tags completos.
+        Cada iteración:
+          1. Busca el tag completo más temprano en el buffer.
+          2. Si lo encuentra → emite contenido previo + section_start, continúa.
+          3. Si no → decide si retener el final del buffer (posible tag parcial)
+             o emitir todo y vaciar.
+        """
+        events: List[dict] = []
+
+        while True:
+            # Buscar el tag completo más cercano al inicio del buffer
+            earliest_tag: Optional[str] = None
+            earliest_pos: Optional[int] = None
+
+            for tag in SECTION_TAGS:
+                pos = self.buffer.find(tag)
+                if pos != -1 and (earliest_pos is None or pos < earliest_pos):
+                    earliest_tag = tag
+                    earliest_pos = pos
+
+            if earliest_tag is not None:
+                # — Emitir contenido que precede al tag —
+                before = self.buffer[:earliest_pos]
+                if before:
+                    events += self._content_events(before)
+
+                # — Cerrar sección actual —
+                if self.current_section and self.current_section not in self.sections_completed:
+                    self.sections_completed.append(self.current_section)
+
+                # — Abrir nueva sección —
+                section_name = earliest_tag[1:-1]   # quitar [ y ]
+                events.append({"type": "section_start", "section": section_name})
+                self.current_section = section_name
+
+                # — Avanzar buffer más allá del tag —
+                rest = self.buffer[earliest_pos + len(earliest_tag):]
+                self.buffer = rest.lstrip("\n")   # newline inmediato tras el tag es decorativo
+
+                # — Continuar el bucle: puede haber más tags —
+
+            else:
+                # No hay tag completo en el buffer.
+                # ¿El final del buffer podría ser el inicio de un tag?
+                bracket = self.buffer.rfind("[")
+
+                if bracket != -1:
+                    partial = self.buffer[bracket:]
+                    is_potential = (
+                        any(tag.startswith(partial) for tag in SECTION_TAGS)
+                        and len(partial) < MAX_TAG_LEN
+                    )
+                    if is_potential:
+                        # Emitir lo que hay antes del [ y retener el resto
+                        safe = self.buffer[:bracket]
+                        if safe:
+                            events += self._content_events(safe)
+                        self.buffer = partial
+                    else:
+                        # El [ no va a formar un tag — emitir todo
+                        if self.buffer:
+                            events += self._content_events(self.buffer)
+                        self.buffer = ""
+                else:
+                    # Sin [ en el buffer — emitir todo sin reservas
+                    if self.buffer:
+                        events += self._content_events(self.buffer)
+                    self.buffer = ""
+
+                break   # No quedan tags que procesar en este ciclo
+
+        return events
+
+    def _content_events(self, text: str) -> List[dict]:
+        """Envuelve un fragmento de texto en el evento token de la sección actual."""
+        if not text:
+            return []
+        return [{"type": "token", "section": self.current_section, "content": text}]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SYSTEM PROMPT
 # ══════════════════════════════════════════════════════════════════════════════
 
 SYSTEM_PROMPT = """Eres un analista independiente de software CRM para pymes europeas.
@@ -102,7 +258,7 @@ RESTRICCIONES ABSOLUTAS:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CONSTRUCCIÓN DEL MENSAJE DE USUARIO
+# BUILD USER MESSAGE
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_user_message(
@@ -111,14 +267,8 @@ def build_user_message(
     semantic_context: List[dict],
     excluded_crms: List[ExclusionResult] = [],
 ) -> str:
-    """
-    Serializa el ScoringOutput y el perfil en el mensaje estructurado
-    que recibirá Claude. El formato es texto plano legible, no JSON,
-    para que el LLM lo procese con menos fricción.
-    """
     lines: List[str] = []
 
-    # ── Perfil de empresa ─────────────────────────────────────────────────────
     lines += [
         "## PERFIL DE EMPRESA",
         f"Sector: {profile.sector}  |  Modelo: {profile.modelo}",
@@ -133,7 +283,6 @@ def build_user_message(
         lines.append(f"Herramientas en uso: {', '.join(profile.tools)}")
     lines.append("")
 
-    # ── Pesos aplicados ───────────────────────────────────────────────────────
     lines.append("## PESOS APLICADOS AL SCORING")
     for var, w in scoring_output.applied_weights.items():
         lines.append(f"  {var}: {w * 100:.1f}%")
@@ -144,71 +293,54 @@ def build_user_message(
             lines.append(f"  {adj.variable}: {sign}{adj.delta * 100:.0f}%  — {adj.reason}")
     lines.append("")
 
-    # ── Ranking calculado ─────────────────────────────────────────────────────
     lines += [
         "## RANKING CALCULADO — NO MODIFICAR ORDEN NI SCORES",
         f"Confianza del scoring: {scoring_output.scoring_confidence.upper()}",
         "",
     ]
-
     for crm in scoring_output.ranked_crms:
         lines.append(f"#{crm.rank}  {crm.crm_name}  ({crm.crm_category})")
         lines.append(f"  Score final:  {crm.final_score} / 100")
         lines.append(f"  TCO 3 años:   {crm.tco_3y_eur:,.0f} €")
-        lines.append("  Desglose de variables:")
+        lines.append("  Desglose:")
         for var, detail in crm.score_breakdown.items():
             lines.append(
                 f"    {var:<22} {detail.raw_score:4.1f}/10  "
-                f"(peso {detail.weight * 100:.1f}%  →  contribución {detail.weighted_contribution:.3f})"
+                f"(peso {detail.weight * 100:.1f}%)"
             )
         lines.append("")
 
-    # ── CRMs excluidos ────────────────────────────────────────────────────────
     if excluded_crms:
         lines.append("## CRMS EXCLUIDOS DEL RANKING")
         for exc in excluded_crms:
             lines.append(f"  [{exc.filter_code}] {exc.crm_name}: {exc.reason}")
         lines.append("")
 
-    # ── Alertas del sistema ───────────────────────────────────────────────────
     if scoring_output.all_flags:
         lines.append("## ALERTAS DEL SISTEMA")
         for flag in scoring_output.all_flags:
-            lines.append(
-                f"  [{flag.severity.upper()}] {flag.crm_name} / {flag.code}: {flag.message}"
-            )
+            lines.append(f"  [{flag.severity.upper()}] {flag.crm_name} / {flag.code}: {flag.message}")
         lines.append("")
 
-    # ── Contexto semántico (RAG) ──────────────────────────────────────────────
     if semantic_context:
         lines.append("## CONTEXTO DE REVIEWS VERIFICADAS")
-        lines.append("(Fragmentos de opiniones de empresas similares — usa para fundamentar el análisis)")
-        lines.append("")
-        for chunk in semantic_context[:8]:   # máximo 8 chunks para controlar tokens
-            crm_id     = chunk.get("crm_id", "")
-            chunk_type = chunk.get("chunk_type", "")
-            content    = str(chunk.get("content", ""))[:400]
-            lines.append(f"[{crm_id} | {chunk_type}]")
-            lines.append(content)
+        for chunk in semantic_context[:8]:
+            lines.append(f"[{chunk.get('crm_id', '')} | {chunk.get('chunk_type', '')}]")
+            lines.append(str(chunk.get("content", ""))[:400])
             lines.append("")
     else:
-        lines.append("## CONTEXTO DE REVIEWS")
-        lines.append("No hay contexto semántico disponible para esta evaluación.")
-        lines.append("")
+        lines += ["## CONTEXTO DE REVIEWS", "No disponible para esta evaluación.", ""]
 
-    # ── Instrucción final ─────────────────────────────────────────────────────
     lines += [
         "## INSTRUCCIÓN",
         "Genera el veredicto completo siguiendo exactamente el formato de las 6 secciones.",
         "Fundamenta cada sección en los datos del ranking, las alertas y el contexto de reviews.",
-        "El análisis debe ser específico para el perfil de empresa descrito, no genérico.",
     ]
-
     return "\n".join(lines)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STREAMING DEL VEREDICTO
+# STREAM DEL VEREDICTO — con StreamParser
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def stream_verdict(
@@ -218,31 +350,27 @@ async def stream_verdict(
     excluded_crms: List[ExclusionResult] = [],
 ) -> AsyncGenerator[str, None]:
     """
-    Llama a Claude con streaming activado y emite los tokens en formato SSE.
+    Llama a Claude con streaming y emite eventos SSE estructurados.
 
-    Formato de los eventos emitidos:
-      data: {"token": "..."}          ← fragmento de texto generado
-      data: {"type": "done"}          ← stream completado con éxito
-      data: {"type": "error", ...}    ← error recuperable
+    Usa StreamParser para detectar las etiquetas de sección en el stream
+    de tokens y emitir eventos tipados. El frontend no necesita escanear texto.
 
-    El frontend acumula los tokens y detecta las etiquetas de sección
-    ([VEREDICTO], [RANKING], etc.) para renderizar cada bloque con su estilo.
-
-    Args:
-        scoring_output:   Resultado completo del motor de scoring.
-        profile:          Perfil de empresa del intake.
-        semantic_context: Chunks RAG de crm_embeddings (puede ser lista vacía).
-        excluded_crms:    CRMs descartados por los filtros duros.
-
-    Yields:
-        Strings en formato SSE: "data: {json}\n\n"
+    Eventos emitidos (en orden):
+      section_start  → cuando se detecta una nueva sección
+      token          → fragmento de texto de la sección activa
+      done           → stream finalizado, incluye lista de secciones completadas
+      error          → error recuperable con código y mensaje
     """
     user_message = build_user_message(
         scoring_output, profile, semantic_context, excluded_crms
     )
+    parser = StreamParser()
+
+    def sse(event: dict) -> str:
+        return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
     logger.info(
-        f"Iniciando stream Claude — CRMs en ranking: {len(scoring_output.ranked_crms)} "
+        f"Iniciando stream Claude — CRMs: {len(scoring_output.ranked_crms)} "
         f"| Confianza: {scoring_output.scoring_confidence}"
     )
 
@@ -255,31 +383,31 @@ async def stream_verdict(
             messages=[{"role": "user", "content": user_message}],
         ) as stream:
             async for text in stream.text_stream:
-                yield f"data: {json.dumps({'token': text}, ensure_ascii=False)}\n\n"
+                for event in parser.feed(text):
+                    yield sse(event)
 
-        logger.info("Stream Claude completado con éxito")
-        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+        # Vaciar buffer residual
+        for event in parser.flush():
+            yield sse(event)
+
+        logger.info(f"Stream completado — secciones: {parser.sections_completed}")
+        yield sse({"type": "done", "sections_completed": parser.sections_completed})
 
     except anthropic.APITimeoutError:
-        logger.error("Timeout en la llamada a Claude (>45s)")
-        yield (
-            f"data: {json.dumps({'type': 'error', 'code': 'E02', 'message': 'El análisis tardó demasiado. El contenido parcial ya recibido sigue siendo válido. Puedes reintentar solo la generación del veredicto.'})}\n\n"
-        )
+        logger.error("Timeout en llamada a Claude (>45s)")
+        yield sse({"type": "error", "code": "E02",
+                   "message": "El análisis tardó demasiado. El contenido parcial sigue siendo válido. Reintenta la generación."})
 
     except anthropic.RateLimitError:
         logger.error("Rate limit de la API de Anthropic")
-        yield (
-            f"data: {json.dumps({'type': 'error', 'code': 'E03', 'message': 'Límite de uso de la API alcanzado. Reintenta en unos segundos.'})}\n\n"
-        )
+        yield sse({"type": "error", "code": "E03",
+                   "message": "Límite de uso de la API alcanzado. Reintenta en unos segundos."})
 
     except anthropic.APIError as exc:
         logger.error(f"Error de la API de Anthropic: {exc}")
-        yield (
-            f"data: {json.dumps({'type': 'error', 'code': 'E04', 'message': f'Error de la API: {str(exc)}'})}\n\n"
-        )
+        yield sse({"type": "error", "code": "E04", "message": f"Error de la API: {exc}"})
 
     except Exception as exc:
         logger.exception(f"Error inesperado en stream_verdict: {exc}")
-        yield (
-            f"data: {json.dumps({'type': 'error', 'code': 'E99', 'message': 'Error interno. Por favor, inténtalo de nuevo.'})}\n\n"
-        )
+        yield sse({"type": "error", "code": "E99",
+                   "message": "Error interno. Por favor, inténtalo de nuevo."})
