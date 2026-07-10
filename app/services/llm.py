@@ -36,7 +36,7 @@ _client = anthropic.AsyncAnthropic(
 )
 
 MODEL      = "claude-sonnet-4-6"
-MAX_TOKENS = 1800
+MAX_TOKENS = 3500
 TEMPERATURE = 0.3
 
 
@@ -253,6 +253,7 @@ RESTRICCIONES ABSOLUTAS:
 - No menciones precios sin incluir la fecha de verificación que recibirás en el payload.
 - Prohibido usar lenguaje de marketing: "líder del mercado", "solución robusta", "potente", etc.
 - No recomiendes empresas de consultoría o partners específicos.
+- No uses formato Markdown (tablas, negritas con **, listas con guiones). Escribe en prosa corrida, frase por frase, tal como se describe en cada sección.
 - Si scoring_confidence es "low", recomienda verificación adicional antes de decidir.
 - Usa español neutro europeo. Tutea al lector. Sé directo y concreto."""
 
@@ -375,6 +376,8 @@ async def stream_verdict(
     )
 
     try:
+        stop_reason = "end_turn"  # fallback seguro si algo falla antes de leerlo
+
         async with _client.messages.stream(
             model=MODEL,
             max_tokens=MAX_TOKENS,
@@ -386,12 +389,34 @@ async def stream_verdict(
                 for event in parser.feed(text):
                     yield sse(event)
 
-        # Vaciar buffer residual
-        for event in parser.flush():
-            yield sse(event)
+            # flush() debe ir DENTRO del bloque: el buffer puede tener
+            # contenido retenido esperando un tag que nunca terminó de llegar.
+            for event in parser.flush():
+                yield sse(event)
 
-        logger.info(f"Stream completado — secciones: {parser.sections_completed}")
-        yield sse({"type": "done", "sections_completed": parser.sections_completed})
+            # get_final_message() solo es accesible mientras el contexto
+            # async with está abierto — fuera del bloque ya no existe.
+            stop_reason = (await stream.get_final_message()).stop_reason
+
+        # ── Evento terminal según stop_reason ─────────────────────────────────
+        if stop_reason == "max_tokens":
+            logger.warning(
+                f"Stream truncado por límite de tokens (MAX_TOKENS={MAX_TOKENS}). "
+                f"Secciones completadas: {parser.sections_completed}"
+            )
+            yield sse({
+                "type":               "error",
+                "code":               "E_TRUNCATED",
+                "message":            (
+                    "El análisis fue cortado porque Claude alcanzó el límite de longitud. "
+                    "Las secciones ya recibidas son válidas e íntegras. "
+                    "Si esto ocurre con frecuencia, ajusta MAX_TOKENS en llm.py."
+                ),
+                "sections_completed": parser.sections_completed,
+            })
+        else:
+            logger.info(f"Stream completado — secciones: {parser.sections_completed}")
+            yield sse({"type": "done", "sections_completed": parser.sections_completed})
 
     except anthropic.APITimeoutError:
         logger.error("Timeout en llamada a Claude (>45s)")

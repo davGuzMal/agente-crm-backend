@@ -50,6 +50,96 @@ MIN_REVIEWS_FOR_SCORE = 50
 # Puntuación neutra si no hay datos suficientes
 NEUTRAL_SCORE = 5.0
 
+# Mapeo de etiquetas del intake → slugs del campo best_fit_sectors en Supabase.
+#
+# Cada sector del intake puede corresponderse con VARIOS slugs en la BD porque
+# los slugs son más granulares (ej. "tech" + "startups" + "PLG" ≈ "Tecnología / SaaS").
+# Usar listas permite absorber la heterogeneidad de la BD sin tocarla.
+#
+# Mantener sincronizado con los valores reales de crm_catalog.best_fit_sectors.
+SECTOR_SLUG_MAP: dict[str, list[str] | None] = {
+    "Tecnología / SaaS": [
+        "tech", "startups", "PLG", "remote_software_engineering",
+    ],
+    "Servicios profesionales": [
+        "servicios_profesionales", "servicios_b2b", "consultoria",
+        "professional_coaching",
+    ],
+    "Retail / eCommerce": [
+        "retail", "e-commerce",
+    ],
+    "Manufactura": [
+        "manufactura", "manufacturing",         # "manufacturing" = typo en BD, cubre los dos
+        "construction_contracting",
+    ],
+    "Salud / Farma": [
+        "salud",
+    ],
+    "Finanzas / Seguros": [
+        "finanzas", "venture_capital",
+    ],
+    "Inmobiliaria": [
+        "inmobiliaria", "real_state",            # "real_state" = typo en BD, cubre los dos
+        "property_development_firms", "commercial_brokerages",
+    ],
+    "Hostelería / turismo": [
+        "hosteleria",                            # slug aún no en BD — el fallback lo cubre
+    ],
+    "Educación": [
+        "educacion",
+    ],
+    "Agencias / Consultoría": [
+        "agencias", "consultoria", "design_studios",
+        "digital_marketing", "media_creative", "digital_media",
+        "content_creators",
+    ],
+    "Otro": None,   # sin sector definido → incluir todos los CRMs
+}
+
+# Slugs que describen tipo de empresa o modelo de negocio, no sector vertical.
+# Un CRM cuyos best_fit_sectors sean SOLO estos slugs se trata como universal
+# (aplica a cualquier sector si el modelo del intake es B2B).
+CROSS_CUTTING_SLUGS: frozenset[str] = frozenset({
+    "B2B", "sales", "startups", "PLG",
+})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PREFILTRO DE SECTOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _sector_matches(catalog: dict, intake_sector: str) -> bool:
+    """
+    Devuelve True si este CRM debe evaluarse para el sector del intake.
+
+    Usa best_fit_sectors de crm_catalog (slugs cortos) y SECTOR_SLUG_MAP
+    para traducir el sector del intake al conjunto de slugs relevantes.
+
+    Reglas en orden de evaluación:
+      1. best_fit_sectors vacío/null → CRM universal, siempre True.
+      2. best_fit_sectors contiene SOLO slugs cruzados (B2B, sales…) → universal.
+      3. Sector del intake es "Otro" o sin slugs definidos → True (sin filtrar).
+      4. Intersección entre slugs del intake y best_fit_sectors → True si hay match.
+         False si no hay ningún slug en común.
+    """
+    crm_slugs: set[str] = set(catalog.get("best_fit_sectors") or [])
+
+    # Regla 1: sin restricción sectorial definida
+    if not crm_slugs:
+        return True
+
+    # Regla 2: solo slugs cruzados → el CRM aplica a cualquier sector B2B
+    if crm_slugs.issubset(CROSS_CUTTING_SLUGS):
+        return True
+
+    # Regla 3: sector del intake sin definición de slugs
+    intake_slugs = SECTOR_SLUG_MAP.get(intake_sector)
+    if intake_slugs is None:
+        return True  # "Otro" o sector desconocido
+
+    # Regla 4: intersección
+    return bool(crm_slugs & set(intake_slugs))
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CLIENTE SUPABASE
@@ -296,6 +386,13 @@ def load_crm_candidates(profile: IntakeProfile) -> List[CRMCandidate]:
 
     for catalog in catalog_rows:
         crm_id = catalog["crm_id"]
+
+        # Prefiltro de sector: descartar CRMs de nicho que no aplican al sector
+        if not _sector_matches(catalog, profile.sector):
+            logger.debug(
+                f"[{crm_id}] Omitido — no aplica al sector '{profile.sector}'"
+            )
+            continue
 
         pricing = pricing_by_id.get(crm_id, {})
         scoring = scoring_by_id.get(crm_id, {})

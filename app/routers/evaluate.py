@@ -27,11 +27,87 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from app.models.intake import IntakeProfile
 from app.services.retrieval import load_crm_candidates, search_semantic_context
 from app.services.filter import apply_hard_filters
-from app.services.scoring import score_and_rank
+from app.services.scoring import score_and_rank, ScoredCRM
 from app.services.llm import stream_verdict
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SERIALIZACIÓN DEL EVENTO METADATA
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Nombres legibles de las 6 variables de scoring para el frontend
+VARIABLE_LABELS_ES: dict[str, str] = {
+    "tco":               "Coste total (TCO 3 años)",
+    "curva_aprendizaje": "Curva de aprendizaje",
+    "complejidad_impl":  "Complejidad de implementación",
+    "lockin_risk":       "Riesgo de dependencia",
+    "soporte":           "Calidad de soporte",
+    "reviews":           "Opiniones verificadas",
+}
+
+# Umbrales para clasificar cada variable como fortaleza, debilidad o neutral
+PRO_THRESHOLD = 7.5   # score ≥ 7.5 → fortaleza
+CON_THRESHOLD = 5.0   # score < 5.0 → debilidad
+
+
+def _serialize_crm(crm: ScoredCRM) -> dict:
+    """
+    Serializa un ScoredCRM al formato que necesita el frontend para renderizar:
+      - Las 6 tarjetas de desglose por variable (score + peso + categoría)
+      - Las listas de pros y contras derivadas automáticamente de los scores
+      - Las alertas específicas del CRM
+
+    Los pros/contras se derivan de umbrales sobre raw_score, no de prosa del LLM.
+    Esto evita parsing frágil y da datos estructurados inmediatos al frontend.
+    """
+    breakdown: dict = {}
+    pros: list = []
+    cons: list = []
+
+    for var, detail in crm.score_breakdown.items():
+        label     = VARIABLE_LABELS_ES.get(var, var)
+        score     = round(detail.raw_score, 1)
+        weight_pct = round(detail.weight * 100, 1)
+
+        if score >= PRO_THRESHOLD:
+            category = "pro"
+            pros.append({"variable": var, "label": label, "score": score})
+        elif score < CON_THRESHOLD:
+            category = "con"
+            cons.append({"variable": var, "label": label, "score": score})
+        else:
+            category = "neutral"
+
+        breakdown[var] = {
+            "label":      label,
+            "score":      score,
+            "weight_pct": weight_pct,
+            "category":   category,
+        }
+
+    return {
+        "rank":            crm.rank,
+        "id":              crm.crm_id,
+        "name":            crm.crm_name,
+        "category":        crm.crm_category,
+        "score":           crm.final_score,
+        "tco_3y":          crm.tco_3y_eur,
+        "tco_score":       round(crm.tco_score, 1),
+        "score_breakdown": breakdown,
+        "pros":            pros,
+        "cons":            cons,
+        "flags": [
+            {
+                "code":     f.code,
+                "severity": f.severity,
+                "message":  f.message,
+            }
+            for f in crm.flags
+        ],
+    }
 
 
 @router.post("/evaluate")
@@ -115,26 +191,53 @@ async def evaluate(profile: IntakeProfile):
         El frontend puede usar los metadatos para renderizar el ranking
         visual mientras Claude genera el texto narrativo.
         """
-        # Evento inicial: metadatos del scoring (no depende de Claude)
+        # Evento inicial: metadatos del scoring (llega antes del primer token de Claude).
+        # El frontend usa este evento para renderizar el ranking visual completo
+        # mientras Claude genera el texto narrativo encima.
         metadata = {
             "type": "metadata",
             "scoring": {
-                "winner":    scoring_output.winner.crm_name if scoring_output.winner else None,
-                "runner_up": scoring_output.runner_up.crm_name if scoring_output.runner_up else None,
+                "winner":     scoring_output.winner.crm_name if scoring_output.winner else None,
+                "runner_up":  scoring_output.runner_up.crm_name if scoring_output.runner_up else None,
                 "confidence": scoring_output.scoring_confidence,
+
+                # Ranking completo con desglose por variable, pros/contras y alertas.
+                # Cada item generado por _serialize_crm() incluye todo lo que
+                # el frontend necesita para renderizar las tarjetas sin esperar al LLM.
                 "ranking": [
-                    {
-                        "rank":      crm.rank,
-                        "name":      crm.crm_name,
-                        "score":     crm.final_score,
-                        "tco_3y":    crm.tco_3y_eur,
-                    }
+                    _serialize_crm(crm)
                     for crm in scoring_output.ranked_crms
                 ],
+
+                # CRMs descartados por los filtros duros (para mostrar como "opciones futuras")
                 "excluded": [
-                    {"name": e.crm_name, "code": e.filter_code}
+                    {
+                        "name":   e.crm_name,
+                        "code":   e.filter_code,
+                        "reason": e.reason,
+                    }
                     for e in filter_output.excluded
                 ],
+
+                # Ajustes de pesos aplicados al perfil (para mostrar transparencia del scoring)
+                "weight_adjustments": [
+                    {
+                        "variable":  adj.variable,
+                        "label":     VARIABLE_LABELS_ES.get(adj.variable, adj.variable),
+                        "delta_pct": round(adj.delta * 100, 1),
+                        "reason":    adj.reason,
+                    }
+                    for adj in scoring_output.weight_adjustments
+                ],
+
+                "applied_weights": {
+                    var: {
+                        "label":     VARIABLE_LABELS_ES.get(var, var),
+                        "weight_pct": round(w * 100, 1),
+                    }
+                    for var, w in scoring_output.applied_weights.items()
+                },
+
                 "flags_count": len(scoring_output.all_flags),
             },
         }

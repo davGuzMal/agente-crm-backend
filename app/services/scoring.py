@@ -162,6 +162,7 @@ class ScoringOutput(BaseModel):
 def score_and_rank(
     filter_output: FilterOutput,
     profile: IntakeProfile,
+    top_n: int = 5,
 ) -> ScoringOutput:
     """
     Calcula el score ponderado de los CRMs que pasaron los filtros y los ordena.
@@ -169,9 +170,13 @@ def score_and_rank(
     Args:
         filter_output: Resultado de apply_hard_filters(). Solo se usan los .passed.
         profile:       Perfil de empresa del intake.
+        top_n:         Número máximo de CRMs en el ranking final. Los CRMs más
+                       allá de top_n se puntúan pero no llegan al LLM. Default 5.
+                       Razón: el LLM analiza con más profundidad un conjunto
+                       pequeño; pasar 15 CRMs diluye el veredicto y consume tokens.
 
     Returns:
-        ScoringOutput con el ranking completo y todos los metadatos.
+        ScoringOutput con el ranking (máx. top_n CRMs) y todos los metadatos.
 
     Raises:
         ValueError: Si no hay CRMs que hayan pasado los filtros.
@@ -185,7 +190,7 @@ def score_and_rank(
     # 1. Pesos dinámicos
     weights, adjustments = calculate_dynamic_weights(profile)
 
-    # 2. Puntuar cada CRM
+    # 2. Puntuar TODOS los candidatos que pasaron los filtros
     scored: List[ScoredCRM] = []
     all_flags: List[AlertFlag] = []
 
@@ -197,11 +202,18 @@ def score_and_rank(
     # 3. Ordenar por score final (mayor primero)
     scored.sort(key=lambda x: x.final_score, reverse=True)
 
-    # 4. Asignar ranking
+    # 4. Recortar al top_n — solo estos llegan al LLM
+    scored = scored[:top_n]
+
+    # 5. Asignar ranking (sobre el conjunto recortado)
     for i, crm in enumerate(scored):
         crm.rank = i + 1
 
-    # 5. Confianza global
+    # 6. Las alertas solo de los CRMs en el ranking final
+    final_ids = {c.crm_id for c in scored}
+    all_flags = [f for f in all_flags if f.crm_id in final_ids]
+
+    # 7. Confianza global
     confidence = _calculate_confidence(scored, all_flags)
 
     return ScoringOutput(
