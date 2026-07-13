@@ -21,7 +21,6 @@ Nota sobre async:
 import logging
 from typing import List, Optional
 from uuid import UUID
-
 from supabase import create_client, Client
 
 from app.config import settings
@@ -242,28 +241,39 @@ def _calculate_annual_license(pricing_row: dict, num_users: int) -> Optional[flo
 # DERIVACIÓN DE REVIEW SCORE
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _derive_review_score(quality_row: dict) -> Optional[float]:
+def _derive_review_score(
+    quality_row: dict,
+    sector_avg_rating: Optional[float],
+) -> Optional[float]:
     """
-    Construye el review_score (0–10) a partir de los metadatos de calidad.
+    Construye el review_score (0–10) a partir de dos fuentes distintas:
 
-    Combina dos señales:
-      1. Puntuación media de G2 (escala 1–5 → normalizada a 0–10)
-      2. Volumen de reviews (penaliza puntuaciones con pocas reseñas)
+      - review_count_g2:   total de reseñas G2 del CRM → viene de crm_data_quality.
+                           Se usa para el umbral mínimo de fiabilidad.
+      - sector_avg_rating: rating medio del sector específico del intake → viene de
+                           crm_embeddings.metadata (chunk_type_id=1, review_summary_sector).
+                           Se pasa como parámetro porque load_crm_candidates() lo
+                           obtiene con una query separada antes de construir candidatos.
 
-    Si no hay datos suficientes, devuelve None (scoring.py usará 5.0 como fallback).
+    Si no hay avg_rating para el sector del intake o hay pocas reseñas globales,
+    devuelve None → scoring.py usará 5.0 como fallback y marcará confianza "medium".
     """
     review_count = quality_row.get("review_count_g2") or 0
-    avg_rating = quality_row.get("avg_g2_rating")  # 1.0–5.0
 
-    if avg_rating is None or review_count < MIN_REVIEWS_FOR_SCORE:
+    if sector_avg_rating is None or review_count < MIN_REVIEWS_FOR_SCORE:
         return None
 
-    # Normalizar rating de escala 1–5 a 0–10
-    normalized = (float(avg_rating) - 1) / 4 * 10
+    # Normalizar rating G2 de escala 1–5 a 0–10
+    normalized = (float(sector_avg_rating) - 1) / 4 * 10
 
-    # Penalización por volumen bajo (entre MIN_REVIEWS y 200 reviews)
+    # Penalización por volumen bajo (entre MIN_REVIEWS_FOR_SCORE y 200 reseñas)
     if review_count < 200:
-        volume_factor = 0.85 + (review_count - MIN_REVIEWS_FOR_SCORE) / (200 - MIN_REVIEWS_FOR_SCORE) * 0.15
+        volume_factor = (
+            0.85
+            + (review_count - MIN_REVIEWS_FOR_SCORE)
+            / (200 - MIN_REVIEWS_FOR_SCORE)
+            * 0.15
+        )
         normalized *= volume_factor
 
     return round(max(0.0, min(10.0, normalized)), 2)
@@ -280,6 +290,7 @@ def _build_candidate(
     scoring: dict,
     quality: dict,
     annual_license: float,
+    sector_avg_rating: Optional[float] = None,
 ) -> CRMCandidate:
     """
     Construye un CRMCandidate completo a partir de las filas de Supabase.
@@ -323,7 +334,7 @@ def _build_candidate(
         implementation_complexity_score=scoring.get("implementation_complexity_score"),
         lockin_risk_score=scoring.get("lockin_risk_score"),
         support_score=scoring.get("support_score"),
-        review_score=_derive_review_score(quality),
+        review_score=_derive_review_score(quality, sector_avg_rating),
 
         # ── Soporte e integraciones ───────────────────────────────────────────
         native_integrations=scoring.get("native_integrations") or [],
@@ -371,6 +382,17 @@ def load_crm_candidates(profile: IntakeProfile) -> List[CRMCandidate]:
         scoring_rows  = client.table("crm_scoring").select("*").execute().data
         quality_rows  = client.table("crm_data_quality").select("*").execute().data
 
+        # Obtener avg_rating sector-específico desde crm_embeddings.
+        # chunk_type_id=1 = review_summary_sector (ver tabla chunk_types).
+        # Filtramos en Python porque el campo sector está dentro del jsonb metadata.
+        review_chunks = (
+            client.table("crm_embeddings")
+            .select("crm_id, metadata")
+            .eq("chunk_type_id", 1)
+            .execute()
+            .data
+        )
+
     except Exception as exc:
         raise RuntimeError(
             f"No se pudo conectar con Supabase: {exc}. "
@@ -381,6 +403,30 @@ def load_crm_candidates(profile: IntakeProfile) -> List[CRMCandidate]:
     pricing_by_id = {r["crm_id"]: r for r in pricing_rows}
     scoring_by_id = {r["crm_id"]: r for r in scoring_rows}
     quality_by_id = {r["crm_id"]: r for r in quality_rows}
+
+    # Construir índice de avg_rating por CRM para el sector del intake.
+    # Si un CRM tiene varios chunks de review para distintos sectores, usamos
+    # el que coincide con el sector del intake (primary slug del SECTOR_SLUG_MAP).
+    intake_slugs = SECTOR_SLUG_MAP.get(profile.sector) or []
+    primary_slug = intake_slugs[0] if intake_slugs else None
+
+    avg_rating_by_crm: dict[str, float] = {}
+    for row in review_chunks:
+        meta = row.get("metadata") or {}
+        if meta.get("sector") == primary_slug and "avg_rating" in meta:
+            # Guardar solo si aún no tenemos un valor para este CRM
+            # (en caso de varios chunks del mismo sector, conservar el primero)
+            crm_id_r = row.get("crm_id")
+            if crm_id_r and crm_id_r not in avg_rating_by_crm:
+                avg_rating_by_crm[crm_id_r] = float(meta["avg_rating"])
+
+    if primary_slug:
+        logger.debug(
+            f"avg_rating sector '{primary_slug}' encontrado para: "
+            f"{list(avg_rating_by_crm.keys())}"
+        )
+    else:
+        logger.debug("Sin slug primario para sector del intake — review_score usará fallback")
 
     candidates: List[CRMCandidate] = []
 
@@ -407,7 +453,10 @@ def load_crm_candidates(profile: IntakeProfile) -> List[CRMCandidate]:
             )
             continue
 
-        candidate = _build_candidate(crm_id, catalog, pricing, scoring, quality, annual_license)
+        candidate = _build_candidate(
+            crm_id, catalog, pricing, scoring, quality, annual_license,
+            sector_avg_rating=avg_rating_by_crm.get(crm_id),
+        )
         candidates.append(candidate)
 
     logger.info(f"Cargados {len(candidates)} CRMs candidatos (de {len(catalog_rows)} en catálogo)")
