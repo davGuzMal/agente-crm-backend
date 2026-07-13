@@ -36,7 +36,7 @@ _client = anthropic.AsyncAnthropic(
 )
 
 MODEL      = "claude-sonnet-4-6"
-MAX_TOKENS = 3500
+MAX_TOKENS = 6000
 TEMPERATURE = 0.3
 
 
