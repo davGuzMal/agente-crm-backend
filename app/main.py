@@ -8,10 +8,16 @@ app = FastAPI(
     description="API de evaluación de CRM para PYMES europeas"
 )
 
-# CORS — ajusta en producción
+# CORS — el frontend llama a /api/evaluate en su propio dominio (Vercel) y
+# ese route handler reenvía servidor-a-servidor hacia aquí, así que esto no
+# es parte del camino crítico. Se mantiene por si hay llamadas directas
+# desde el navegador (debugging, docs de FastAPI, futuros clientes).
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # Next.js dev
+    allow_origins=[
+        "http://localhost:3000",                        # Next.js dev
+        "https://crm-agent-frontend-smoky.vercel.app",   # Frontend en producción
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
