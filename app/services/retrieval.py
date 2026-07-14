@@ -405,20 +405,37 @@ def load_crm_candidates(profile: IntakeProfile) -> List[CRMCandidate]:
     quality_by_id = {r["crm_id"]: r for r in quality_rows}
 
     # Construir índice de avg_rating por CRM para el sector del intake.
-    # Si un CRM tiene varios chunks de review para distintos sectores, usamos
-    # el que coincide con el sector del intake (primary slug del SECTOR_SLUG_MAP).
+    # Un mismo CRM puede tener varios chunks para el mismo sector (distintas
+    # tandas de scraping G2/Capterra, con esquemas de metadata ligeramente
+    # distintos). company_size en el metadata NO es una dimensión limpia para
+    # desambiguar — es una lista de rangos mezclados que describe la mezcla de
+    # tamaños de empresa detrás de ese avg_rating, no una etiqueta por chunk.
+    # En vez de quedarnos con el primer chunk encontrado (arbitrario, depende
+    # del orden no garantizado de la query), promediamos ponderando por
+    # review_count: un chunk con 847 reseñas debe pesar más que uno con 14.
     intake_slugs = SECTOR_SLUG_MAP.get(profile.sector) or []
     primary_slug = intake_slugs[0] if intake_slugs else None
 
-    avg_rating_by_crm: dict[str, float] = {}
+    _rating_weighted_sum: dict[str, float] = {}
+    _rating_weight_total: dict[str, float] = {}
+
     for row in review_chunks:
         meta = row.get("metadata") or {}
         if meta.get("sector") == primary_slug and "avg_rating" in meta:
-            # Guardar solo si aún no tenemos un valor para este CRM
-            # (en caso de varios chunks del mismo sector, conservar el primero)
             crm_id_r = row.get("crm_id")
-            if crm_id_r and crm_id_r not in avg_rating_by_crm:
-                avg_rating_by_crm[crm_id_r] = float(meta["avg_rating"])
+            if not crm_id_r:
+                continue
+            # Fallback a peso 1 si algún chunk no trae review_count.
+            weight = float(meta.get("review_count") or 1)
+            _rating_weighted_sum[crm_id_r] = (
+                _rating_weighted_sum.get(crm_id_r, 0.0) + float(meta["avg_rating"]) * weight
+            )
+            _rating_weight_total[crm_id_r] = _rating_weight_total.get(crm_id_r, 0.0) + weight
+
+    avg_rating_by_crm: dict[str, float] = {
+        crm_id_r: _rating_weighted_sum[crm_id_r] / _rating_weight_total[crm_id_r]
+        for crm_id_r in _rating_weighted_sum
+    }
 
     if primary_slug:
         logger.debug(
