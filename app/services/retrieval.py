@@ -470,7 +470,7 @@ def load_crm_candidates(profile: IntakeProfile) -> List[CRMCandidate]:
 def search_semantic_context(
     crm_ids: List[UUID],
     profile: IntakeProfile,
-    top_k: int = 5,
+    top_k: int = 2,
 ) -> List[dict]:
     """
     Búsqueda vectorial en crm_embeddings para recuperar el contexto semántico
