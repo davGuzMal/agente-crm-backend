@@ -9,7 +9,6 @@ de sección ([VEREDICTO], [RANKING]…) aunque lleguen fragmentadas en
 múltiples tokens, y emite eventos SSE estructurados.
 
 El frontend recibe eventos tipados y nunca necesita escanear strings:
-
   {"type": "metadata",      ...}           ← ranking pre-calculado (de evaluate.py)
   {"type": "section_start", "section": X}  ← inicio de sección detectado
   {"type": "token",  "section": X, "content": "..."}  ← fragmento de texto
