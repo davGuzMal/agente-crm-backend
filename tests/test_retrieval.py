@@ -206,36 +206,42 @@ class TestCalculateAnnualLicense:
 
 class TestDeriveReviewScore:
 
+    # NOTA: desde el commit 9cd7508, _derive_review_score(quality_row, sector_avg_rating)
+    # ya no lee el rating de quality_row (avg_g2_rating) — el rating ahora viene del
+    # promedio ponderado sobre crm_embeddings.metadata (chunk_type_id=1) para el sector
+    # del intake, calculado en load_crm_candidates() y pasado como segundo argumento.
+    # quality_row solo aporta review_count_g2 (umbral mínimo de fiabilidad).
+
     def test_rating_perfecto_da_score_alto(self):
-        quality = {"review_count_g2": 500, "avg_g2_rating": 5.0}
-        score = _derive_review_score(quality)
+        quality = {"review_count_g2": 500}
+        score = _derive_review_score(quality, sector_avg_rating=5.0)
         assert score == pytest.approx(10.0, abs=0.1)
 
     def test_rating_medio_da_score_medio(self):
-        quality = {"review_count_g2": 500, "avg_g2_rating": 3.0}
-        score = _derive_review_score(quality)
+        quality = {"review_count_g2": 500}
+        score = _derive_review_score(quality, sector_avg_rating=3.0)
         # (3.0 - 1) / 4 × 10 = 5.0
         assert score == pytest.approx(5.0, abs=0.1)
 
     def test_pocas_reviews_retorna_none(self):
-        quality = {"review_count_g2": 10, "avg_g2_rating": 4.5}
-        assert _derive_review_score(quality) is None
+        quality = {"review_count_g2": 10}
+        assert _derive_review_score(quality, sector_avg_rating=4.5) is None
 
     def test_sin_rating_retorna_none(self):
-        quality = {"review_count_g2": 500, "avg_g2_rating": None}
-        assert _derive_review_score(quality) is None
+        quality = {"review_count_g2": 500}
+        assert _derive_review_score(quality, sector_avg_rating=None) is None
 
     def test_dict_vacio_retorna_none(self):
-        assert _derive_review_score({}) is None
+        assert _derive_review_score({}, sector_avg_rating=None) is None
 
     def test_score_nunca_supera_10(self):
-        quality = {"review_count_g2": 1000, "avg_g2_rating": 5.0}
-        score = _derive_review_score(quality)
+        quality = {"review_count_g2": 1000}
+        score = _derive_review_score(quality, sector_avg_rating=5.0)
         assert score <= 10.0
 
     def test_score_nunca_negativo(self):
-        quality = {"review_count_g2": 100, "avg_g2_rating": 1.0}
-        score = _derive_review_score(quality)
+        quality = {"review_count_g2": 100}
+        score = _derive_review_score(quality, sector_avg_rating=1.0)
         assert score >= 0.0
 
 
@@ -303,7 +309,6 @@ class TestBuildCandidate:
         }
         quality = {
             "review_count_g2": 300,
-            "avg_g2_rating": 4.2,
             "scoring_confidence": "high",
         }
         return catalog, pricing, scoring, quality
@@ -330,10 +335,20 @@ class TestBuildCandidate:
 
     def test_review_score_derivado_de_quality(self):
         catalog, pricing, scoring, quality = self._make_rows()
-        # avg_g2_rating=4.2 con 300 reviews → review_score calculado
-        candidate = _build_candidate("crm_001", catalog, pricing, scoring, quality, 1000.0)
+        # sector_avg_rating=4.2 con 300 reviews → review_score calculado
+        candidate = _build_candidate(
+            "crm_001", catalog, pricing, scoring, quality, 1000.0,
+            sector_avg_rating=4.2,
+        )
         assert candidate.review_score is not None
         assert 0 <= candidate.review_score <= 10
+
+    def test_sin_sector_avg_rating_review_score_es_none(self):
+        catalog, pricing, scoring, quality = self._make_rows()
+        # Sin sector_avg_rating (ningún chunk de reviews coincide con el
+        # sector del intake) → review_score debe quedar en None, no fallar.
+        candidate = _build_candidate("crm_001", catalog, pricing, scoring, quality, 1000.0)
+        assert candidate.review_score is None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
