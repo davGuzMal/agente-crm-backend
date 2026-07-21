@@ -22,10 +22,11 @@ import logging
 import uuid
 from typing import AsyncGenerator, Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 
 from app.models.intake import IntakeProfile
+from app.models.feedback import EvaluationFeedback
 from app.services.retrieval import load_crm_candidates, search_semantic_context, _get_client
 from app.services.filter import apply_hard_filters
 from app.services.scoring import score_and_rank, ScoredCRM
@@ -351,3 +352,48 @@ async def evaluate(profile: IntakeProfile):
             "X-Accel-Buffering": "no",      # desactiva buffering en nginx/proxy
         },
     )
+
+
+@router.patch("/evaluation-sessions/{session_id}")
+async def update_evaluation_feedback(session_id: str, feedback: EvaluationFeedback):
+    """
+    Actualiza el feedback real de una sesión de evaluación ya persistida.
+
+    Pensado para el ciclo de pruebas piloto (Semana 8): después de hablar
+    con la empresa y saber qué CRM eligió de verdad y qué le pareció el
+    veredicto, se llama a este endpoint con el session_id devuelto/generado
+    en su momento por /evaluate para rellenar crm_elegido_real y
+    feedback_satisfaccion — las dos columnas que /evaluate nunca escribe,
+    porque en el momento del veredicto todavía no existen.
+    """
+    update_data = feedback.model_dump(exclude_none=True)
+
+    if not update_data:
+        raise HTTPException(
+            status_code=400,
+            detail="Debes enviar al menos uno de: crm_elegido_real, feedback_satisfaccion.",
+        )
+
+    try:
+        client = _get_client()
+        result = (
+            client.table("evaluation_sessions")
+            .update(update_data)
+            .eq("session_id", session_id)
+            .execute()
+        )
+    except Exception as exc:
+        logger.error(f"Error actualizando evaluation_sessions ({session_id}): {exc}")
+        raise HTTPException(
+            status_code=503,
+            detail="No se pudo conectar con la base de datos. Inténtalo de nuevo.",
+        )
+
+    if not result.data:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No existe ninguna sesión de evaluación con session_id={session_id}.",
+        )
+
+    logger.info(f"Feedback actualizado para sesión {session_id}: {list(update_data.keys())}")
+    return {"session_id": session_id, "updated_fields": list(update_data.keys())}
