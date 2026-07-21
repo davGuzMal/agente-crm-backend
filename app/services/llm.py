@@ -325,7 +325,7 @@ def build_user_message(
 
     if semantic_context:
         lines.append("## CONTEXTO DE REVIEWS VERIFICADAS")
-        for chunk in semantic_context[:8]:
+        for chunk in semantic_context[:10]:
             lines.append(f"[{chunk.get('crm_id', '')} | {chunk.get('chunk_type', '')}]")
             lines.append(str(chunk.get("content", ""))[:400])
             lines.append("")

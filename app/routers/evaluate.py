@@ -233,7 +233,12 @@ async def evaluate(profile: IntakeProfile):
     )
 
     # ── Paso 4: Contexto semántico para RAG ───────────────────────────────────
-    crm_ids = [c.crm_id for c in filter_output.passed]
+    # Usamos scoring_output.ranked_crms (recortado a top_n=5 en scoring.py),
+    # no filter_output.passed. Este último puede incluir CRMs que pasaron los
+    # filtros duros pero quedaron fuera del ranking final por score bajo — sus
+    # chunks competirían por los huecos de semantic_context[:10] en llm.py sin
+    # que el LLM llegue a mencionarlos nunca (no están en ranked_crms).
+    crm_ids = [c.crm_id for c in scoring_output.ranked_crms]
     semantic_context = search_semantic_context(crm_ids, profile)
 
     logger.info(f"Contexto RAG: {len(semantic_context)} chunks recuperados")
