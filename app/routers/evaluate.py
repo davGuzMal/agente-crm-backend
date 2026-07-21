@@ -19,13 +19,14 @@ Respuestas:
 
 import json
 import logging
-from typing import AsyncGenerator
+import uuid
+from typing import AsyncGenerator, Optional
 
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse, JSONResponse
 
 from app.models.intake import IntakeProfile
-from app.services.retrieval import load_crm_candidates, search_semantic_context
+from app.services.retrieval import load_crm_candidates, search_semantic_context, _get_client
 from app.services.filter import apply_hard_filters
 from app.services.scoring import score_and_rank, ScoredCRM
 from app.services.llm import stream_verdict
@@ -108,6 +109,61 @@ def _serialize_crm(crm: ScoredCRM) -> dict:
             for f in crm.flags
         ],
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PERSISTENCIA DE LA SESIÓN DE EVALUACIÓN (feedback loop futuro)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _parse_sse_chunk(chunk: str) -> Optional[dict]:
+    """
+    Reconstruye el dict del evento a partir de la línea SSE ya formateada
+    que produce stream_verdict() (formato "data: {...}\n\n"). Se usa solo
+    para acumular estado a persistir; el chunk original se sigue emitiendo
+    al cliente sin modificar.
+    """
+    if not chunk.startswith("data: "):
+        return None
+    try:
+        return json.loads(chunk[len("data: "):].strip())
+    except json.JSONDecodeError:
+        return None
+
+
+def _persist_evaluation_session(
+    *,
+    session_id: Optional[str],
+    profile: IntakeProfile,
+    scoring_metadata: dict,
+    semantic_context: list,
+    verdict_sections: dict,
+    sections_completed: list,
+    llm_error_code: Optional[str],
+) -> None:
+    """
+    Guarda un registro de la sesión de evaluación en Supabase para permitir,
+    en el futuro, comparar la recomendación del agente contra la elección
+    real de CRM del piloto / su feedback de satisfacción.
+
+    Nunca debe romper la respuesta al usuario: cualquier fallo se loguea
+    y se descarta.
+    """
+    row = {
+        "session_id":          session_id or str(uuid.uuid4()),
+        "intake_profile":       json.loads(profile.model_dump_json()),
+        "scoring_metadata":     scoring_metadata,
+        "semantic_context":     semantic_context,
+        "verdict_sections":     verdict_sections,
+        "sections_completed":   sections_completed,
+        "model":                "claude",
+        "llm_error_code":       llm_error_code,
+    }
+    try:
+        client = _get_client()
+        client.table("evaluation_sessions").insert(row).execute()
+        logger.info(f"Sesión de evaluación persistida: {row['session_id']}")
+    except Exception as exc:
+        logger.error(f"No se pudo persistir la sesión de evaluación: {exc}")
 
 
 @router.post("/evaluate")
@@ -243,6 +299,13 @@ async def evaluate(profile: IntakeProfile):
         }
         yield f"data: {json.dumps(metadata, ensure_ascii=False)}\n\n"
 
+        # Acumuladores para la persistencia de la sesión (se llenan a medida
+        # que se re-parsean los eventos SSE ya formateados que emite
+        # stream_verdict(); el chunk original se reenvía sin tocar).
+        verdict_sections: dict[str, str] = {}
+        sections_completed: list = []
+        llm_error_code: Optional[str] = None
+
         # Tokens del veredicto narrativo de Claude
         async for chunk in stream_verdict(
             scoring_output=scoring_output,
@@ -250,7 +313,29 @@ async def evaluate(profile: IntakeProfile):
             semantic_context=semantic_context,
             excluded_crms=filter_output.excluded,
         ):
+            event = _parse_sse_chunk(chunk)
+            if event:
+                event_type = event.get("type")
+                if event_type == "token" and event.get("section"):
+                    section = event["section"]
+                    verdict_sections[section] = (
+                        verdict_sections.get(section, "") + event.get("content", "")
+                    )
+                elif event_type == "done":
+                    sections_completed = event.get("sections_completed", [])
+                elif event_type == "error":
+                    llm_error_code = event.get("code")
             yield chunk
+
+        _persist_evaluation_session(
+            session_id=profile.session_id,
+            profile=profile,
+            scoring_metadata=metadata["scoring"],
+            semantic_context=semantic_context,
+            verdict_sections=verdict_sections,
+            sections_completed=sections_completed,
+            llm_error_code=llm_error_code,
+        )
 
     return StreamingResponse(
         sse_pipeline(),

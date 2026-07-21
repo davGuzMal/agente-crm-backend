@@ -18,6 +18,15 @@ from typing import Optional, List
 
 class IntakeProfile(BaseModel):
 
+    # ── Identificador de sesión ───────────────────────────────────────────────
+    session_id: Optional[str] = None
+    """
+    Generado por el frontend (sessionStorage) para vincular este perfil con
+    su informe (/informe/[sessionId]). Opcional a nivel de modelo para no
+    romper fixtures/tests que construyen IntakeProfile sin él; el frontend
+    siempre lo envía en producción.
+    """
+
     # ── Paso 1: Sector y modelo de negocio ───────────────────────────────────
     sector: str
     """
