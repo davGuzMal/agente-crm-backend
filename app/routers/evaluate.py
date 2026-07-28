@@ -20,6 +20,7 @@ Respuestas:
 import json
 import logging
 import uuid
+from datetime import datetime, timezone
 from typing import AsyncGenerator, Optional
 
 from fastapi import APIRouter, HTTPException
@@ -27,6 +28,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 
 from app.models.intake import IntakeProfile
 from app.models.feedback import EvaluationFeedback
+from app.models.pilot_contact import PilotContact
 from app.services.retrieval import load_crm_candidates, search_semantic_context, _get_client
 from app.services.filter import apply_hard_filters
 from app.services.scoring import score_and_rank, ScoredCRM
@@ -397,3 +399,53 @@ async def update_evaluation_feedback(session_id: str, feedback: EvaluationFeedba
 
     logger.info(f"Feedback actualizado para sesión {session_id}: {list(update_data.keys())}")
     return {"session_id": session_id, "updated_fields": list(update_data.keys())}
+
+
+@router.post("/pilot-contacts")
+async def upsert_pilot_contact(contact: PilotContact):
+    """
+    Registra o actualiza el contacto de la empresa piloto asociada a una
+    sesión de evaluación, para hacer seguimiento manual durante la Semana 8.
+
+    Vive en pilot_contacts (tabla separada de evaluation_sessions) para no
+    mezclar datos personales (nombre de empresa, email, teléfono) con el
+    payload técnico de la evaluación. session_id es la clave primaria de
+    pilot_contacts, así que llamar este endpoint dos veces para la misma
+    sesión actualiza el registro (upsert) en vez de duplicarlo.
+    """
+    data = contact.model_dump(exclude={"session_id"}, exclude_none=True)
+
+    if not data:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Debes enviar al menos uno de: empresa_nombre, contacto_nombre, "
+                "contacto_email, contacto_telefono, notas."
+            ),
+        )
+
+    data["session_id"] = contact.session_id
+    data["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    try:
+        client = _get_client()
+        client.table("pilot_contacts").upsert(data, on_conflict="session_id").execute()
+    except Exception as exc:
+        error_text = str(exc)
+        if "23503" in error_text or "foreign key" in error_text.lower():
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"No existe ninguna sesión de evaluación con session_id={contact.session_id}. "
+                    "El contacto solo puede registrarse para una sesión ya persistida."
+                ),
+            )
+        logger.error(f"Error guardando pilot_contacts ({contact.session_id}): {exc}")
+        raise HTTPException(
+            status_code=503,
+            detail="No se pudo conectar con la base de datos. Inténtalo de nuevo.",
+        )
+
+    saved_fields = [k for k in data.keys() if k not in ("session_id", "updated_at")]
+    logger.info(f"Contacto piloto guardado para sesión {contact.session_id}: {saved_fields}")
+    return {"session_id": contact.session_id, "saved_fields": saved_fields}
