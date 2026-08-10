@@ -43,9 +43,11 @@ class IntakeProfile(BaseModel):
     """
 
     # ── Paso 2: CRM actual ───────────────────────────────────────────────────
-    sistema_actual: str
+    sistema_actual: Optional[str] = None
     """
-    Opciones:
+    Opcional (CC-002, SPRINT-BE-001): los pasos 2/5/6/7 son diferibles
+    para permitir un veredicto inicial con perfil parcial (3 pasos).
+    Opciones cuando se rellena:
       "No usamos nada / papel" | "Excel o Google Sheets"
       "Un CRM (HubSpot, Salesforce, Zoho…)" | "Un ERP con módulo CRM"
       "Varias herramientas sin integrar"
@@ -88,9 +90,9 @@ class IntakeProfile(BaseModel):
     """
 
     # ── Paso 5: Stack tecnológico ────────────────────────────────────────────
-    suite: str
+    suite: Optional[str] = None
     """
-    Opciones:
+    Opcional (CC-002, SPRINT-BE-001). Opciones cuando se rellena:
       "Google Workspace (Gmail, Drive, Calendar)"
       "Microsoft 365 (Outlook, Teams, SharePoint)"
       "Ambas" | "Ninguna / correo propio"
@@ -108,9 +110,9 @@ class IntakeProfile(BaseModel):
     erp_nombre: Optional[str] = None   # Rama: tiene ERP
 
     # ── Paso 6: Equipo técnico ───────────────────────────────────────────────
-    equipo_tech: str
+    equipo_tech: Optional[str] = None
     """
-    Opciones:
+    Opcional (CC-002, SPRINT-BE-001). Opciones cuando se rellena:
       "Sí, tenemos IT / desarrollador interno"
       "Hay alguien con perfil técnico pero no dedicado"
       "No, somos un equipo no técnico"
@@ -122,16 +124,16 @@ class IntakeProfile(BaseModel):
     consultor_presupuesto: Optional[str] = None  # Rama: puede contratar consultor
 
     # ── Paso 7: Contexto comercial ───────────────────────────────────────────
-    clientes: str
+    clientes: Optional[str] = None
     """
-    Opciones:
+    Opcional (CC-002, SPRINT-BE-001). Opciones cuando se rellena:
       "Menos de 100" | "100 – 500" | "500 – 2.000"
       "2.000 – 10.000" | "Más de 10.000"
     """
 
-    crecimiento: str
+    crecimiento: Optional[str] = None
     """
-    Opciones:
+    Opcional (CC-002, SPRINT-BE-001). Opciones cuando se rellena:
       "Estable, sin cambios significativos" | "Crecimiento moderado (+10–30%)"
       "Crecimiento rápido (+30–100%)" | "Crecimiento muy rápido (más del doble)"
       "Hemos reducido / reestructurado"

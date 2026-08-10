@@ -92,6 +92,11 @@ FAST_GROWTH = {
     "Crecimiento muy rápido (más del doble)",
 }
 
+# Campos de los pasos 2, 5, 6, 7 — diferibles tras el veredicto inicial (CC-002)
+# Cuando alguno (o todos) estén a None, la confianza del scoring baja porque
+# el perfil es parcial y no refleja la situación completa de la empresa.
+DEFERRED_FIELDS = ("sistema_actual", "suite", "equipo_tech", "clientes", "crecimiento")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MODELOS DE OUTPUT
@@ -214,7 +219,7 @@ def score_and_rank(
     all_flags = [f for f in all_flags if f.crm_id in final_ids]
 
     # 7. Confianza global
-    confidence = _calculate_confidence(scored, all_flags)
+    confidence = _calculate_confidence(scored, all_flags, profile)
 
     return ScoringOutput(
         ranked_crms=scored,
@@ -456,10 +461,13 @@ def _adjust_variable_scores(
     native = [t.lower() for t in crm.native_integrations]
     suite_match = False
 
-    if "Google Workspace" in profile.suite:
-        suite_match = any(k in native for k in ["gmail", "google_workspace", "google"])
-    elif "Microsoft 365" in profile.suite:
-        suite_match = any(k in native for k in ["outlook", "microsoft365", "teams"])
+    # SPRINT-BE-001 / CC-002: suite es Optional[str] en perfiles parciales.
+    # Sin este guard, "Google Workspace" in None explota con TypeError.
+    if profile.suite:
+        if "Google Workspace" in profile.suite:
+            suite_match = any(k in native for k in ["gmail", "google_workspace", "google"])
+        elif "Microsoft 365" in profile.suite:
+            suite_match = any(k in native for k in ["outlook", "microsoft365", "teams"])
 
     if suite_match:
         adjusted["complejidad_impl"] = min(10.0, adjusted["complejidad_impl"] + 1.5)
@@ -587,11 +595,16 @@ def _score_crm(
 def _calculate_confidence(
     scored: List[ScoredCRM],
     all_flags: List[AlertFlag],
+    profile: IntakeProfile,
 ) -> str:
     """
     high:   todos los scores son datos reales de Supabase (sin fallback 5.0)
-    medium: algún score usa el valor por defecto (dato ausente en Supabase)
-    low:    múltiples scores por defecto o alertas de datos obsoletos
+            Y el perfil está completo (los 4 pasos opcionales respondidos).
+    medium: algún score usa el valor por defecto, O falta alguno (no todos)
+            de los pasos opcionales del perfil.
+    low:    múltiples scores por defecto / alertas de datos obsoletos,
+            O el usuario no respondió NINGÚN paso opcional (veredicto
+            inicial de 3 pasos, CC-002, sin refinar todavía).
     """
     default_count = sum(
         1
@@ -600,9 +613,12 @@ def _calculate_confidence(
         if detail.raw_score == 5.0
     )
     stale_flags = [f for f in all_flags if f.code == "pricing_stale"]
+    missing_optional = sum(
+        1 for f in DEFERRED_FIELDS if getattr(profile, f) is None
+    )
 
-    if stale_flags or default_count > len(scored) * 2:
+    if stale_flags or default_count > len(scored) * 2 or missing_optional == len(DEFERRED_FIELDS):
         return "low"
-    elif default_count > 0:
+    elif default_count > 0 or missing_optional > 0:
         return "medium"
     return "high"

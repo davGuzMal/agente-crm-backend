@@ -274,11 +274,30 @@ def build_user_message(
         f"Sector: {profile.sector}  |  Modelo: {profile.modelo}",
         f"Presupuesto: {profile.presupuesto}  ({profile.presupuesto_flex})",
         f"Equipo: {profile.empleados}  |  Usuarios CRM: {profile.usuarios_crm}",
-        f"Suite principal: {profile.suite}",
-        f"Sistema actual: {profile.sistema_actual}",
-        f"Perfil técnico: {profile.equipo_tech}",
-        f"Clientes activos: {profile.clientes}  |  Crecimiento: {profile.crecimiento}",
     ]
+    if profile.suite:
+        lines.append(f"Suite principal: {profile.suite}")
+    if profile.sistema_actual:
+        lines.append(f"Sistema actual: {profile.sistema_actual}")
+    if profile.equipo_tech:
+        lines.append(f"Perfil técnico: {profile.equipo_tech}")
+    if profile.clientes or profile.crecimiento:
+        lines.append(
+            f"Clientes activos: {profile.clientes or 'no indicado'}  |  "
+            f"Crecimiento: {profile.crecimiento or 'no indicado'}"
+        )
+    # SPRINT-BE-001 / CC-002: cuando el perfil es parcial, indicamos al LLM
+    # qué campos no se respondieron para que lo mencione con naturalidad.
+    missing = [
+        f for f in ("sistema_actual", "suite", "equipo_tech", "clientes", "crecimiento")
+        if getattr(profile, f) is None
+    ]
+    if missing:
+        lines.append(
+            "Nota: este es un veredicto inicial con perfil parcial — el usuario "
+            "no respondió aún: " + ", ".join(missing) + ". Indícalo con naturalidad "
+            "en el análisis, sin sonar como una disculpa."
+        )
     if profile.tools:
         lines.append(f"Herramientas en uso: {', '.join(profile.tools)}")
     lines.append("")

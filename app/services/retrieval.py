@@ -541,16 +541,25 @@ def _build_profile_query(profile: IntakeProfile) -> str:
     Construye el texto de consulta semántica a partir del perfil del intake.
     El texto debe capturar las dimensiones más relevantes para el filtrado
     de chunks: sector, tamaño, sistema actual y equipo técnico.
+
+    SPRINT-BE-001 / CC-002: los campos sistema_actual, suite, equipo_tech
+    y crecimiento son opcionales (perfil parcial de 3 pasos). Si vienen
+    a None, se omiten — antes generaban literalmente "None" en el query
+    semántico y ensuciaban el RAG.
     """
     parts = [
         f"Empresa del sector {profile.sector}",
         f"modelo {profile.modelo}",
         f"con {profile.usuarios_crm} usuarios de CRM",
-        f"sistema actual: {profile.sistema_actual}",
-        f"stack: {profile.suite}",
-        f"equipo técnico: {profile.equipo_tech}",
-        f"crecimiento: {profile.crecimiento}",
     ]
+    if profile.sistema_actual:
+        parts.append(f"sistema actual: {profile.sistema_actual}")
+    if profile.suite:
+        parts.append(f"stack: {profile.suite}")
+    if profile.equipo_tech:
+        parts.append(f"equipo técnico: {profile.equipo_tech}")
+    if profile.crecimiento:
+        parts.append(f"crecimiento: {profile.crecimiento}")
     return ". ".join(parts)
 
 
