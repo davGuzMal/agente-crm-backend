@@ -1,57 +1,83 @@
 """
-Envío del informe en PDF por SMTP de Zoho Mail EU.
+Envío del informe en PDF vía la API HTTPS de ZeptoMail — no SMTP.
 
-Usa smtplib de la librería estándar de Python — no hace falta ninguna
-dependencia nueva para esto (fpdf2 es la única, y es solo para el PDF).
+Cambio de transporte tras confirmar que Render bloquea los puertos
+SMTP (25/465/587) en el plan gratuito (changelog oficial de Render,
+11/08/2026). El resto del flujo (pdf_report.py, internal.py) no cambia:
+la firma de send_report_email() es la misma.
 
-Decisiones:
-- SMTP_SSL puerto 465 (TLS implícito) — Zoho lo soporta y evita el
-  handshake STARTTLS que añadiría un round-trip innecesario.
-- Variables de entorno: ZOHO_EMAIL, ZOHO_SMTP_HOST, ZOHO_APP_PASSWORD.
-  La contraseña es una "app password" generada en el panel de Zoho, NO
-  la contraseña normal de la cuenta.
-- Sin pool/retry: send_report_email() se llama una vez por destinatario
-  dentro de un lote; los fallos se capturan en el caller (router
-  interno) que registra el error y deja informe_enviado_at = NULL para
-  que el lote de mañana lo reintente.
+Por qué ZeptoMail en vez de SendGrid / Mailgun / Postmark:
+- Ya estamos en el ecosistema Zoho (la cuenta de correo corporativo y el
+  dominio trustcrmagent.com viven ahí), así que el dominio ya está
+  verificado y el from-address es el mismo.
+- Plan gratuito cubre los volúmenes del R11 (lotes diarios de un dígito).
+- API HTTPS estándar — sin SDKs propietarios, sin overhead.
+
+Detalles a tener en cuenta si alguien edita este archivo:
+- "attachments" DEBE ser una lista [{...}]. Pasarlo como objeto suelto
+  devuelve "Invalid value format" desde la API. Es el error más común
+  documentado de ZeptoMail.
+- El header de auth es "Zoho-enczapikey <TOKEN>", con un único espacio
+  entre el esquema y el token. Sin ese espacio: 401.
+- ZEPTOMAIL_API_URL puede ser api.zeptomail.com o api.zeptomail.eu
+  según la región. Configurar la correcta desde el dashboard, NO
+  asumirla (la última vez asumimos mal el host de SMTP y fue justo el
+  problema).
 """
+import base64
 import os
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.application import MIMEApplication
-from email.mime.text import MIMEText
+
+import httpx
 
 
 def send_report_email(to_email: str, pdf_bytes: bytes) -> None:
     """
-    Envía el PDF adjunto a `to_email` desde la cuenta Zoho configurada.
+    Envía el PDF adjunto a `to_email` desde la cuenta Zoho configurada
+    en ZeptoMail.
 
     Args:
         to_email:  Dirección del destinatario (validada ya en pilot_contact.py).
         pdf_bytes: Contenido del PDF, tal cual lo devuelve build_report_pdf().
 
     Raises:
-        KeyError  si falta alguna de las env vars (ZOHO_EMAIL, ZOHO_SMTP_HOST,
-                  ZOHO_APP_PASSWORD). El caller lo capturará.
-        smtplib.SMTPAuthenticationError si las credenciales son inválidas.
-        smtplib.SMTPException / OSError si hay un problema de red.
+        KeyError si falta alguna env var (ZEPTOMAIL_TOKEN, ZEPTOMAIL_API_URL,
+                  ZEPTOMAIL_FROM_EMAIL). El caller (internal.py) lo captura y
+                  deja informe_enviado_at = NULL para reintento al día siguiente.
+        httpx.HTTPStatusError si la API devuelve >= 400. El error incluye
+                  el body de ZeptoMail con el código y mensaje exactos
+                  ("Invalid value format", "Unauthorized", etc.).
+        httpx.RequestError si hay un problema de red.
     """
-    msg = MIMEMultipart()
-    msg["From"] = f"Trust <{os.environ['ZOHO_EMAIL']}>"
-    msg["To"] = to_email
-    msg["Subject"] = "Tu informe de evaluación de CRM — Trust"
+    pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
 
-    body = (
-        "Hola,\n\n"
-        "Adjunto tu informe de evaluación de CRM generado por Trust.\n\n"
-        "Un saludo,\nEquipo Trust"
+    payload = {
+        "from": {
+            "address": os.environ["ZEPTOMAIL_FROM_EMAIL"],
+            "name": "Trust",
+        },
+        "to": [{"email_address": {"address": to_email}}],
+        "subject": "Tu informe de evaluación de CRM — Trust",
+        "textbody": (
+            "Hola,\n\n"
+            "Adjunto tu informe de evaluación de CRM generado por Trust.\n\n"
+            "Un saludo,\nEquipo Trust"
+        ),
+        "attachments": [
+            {
+                "content": pdf_b64,
+                "mime_type": "application/pdf",
+                "name": "informe-trust.pdf",
+            }
+        ],
+    }
+
+    response = httpx.post(
+        f"{os.environ['ZEPTOMAIL_API_URL']}/v1.1/email",
+        json=payload,
+        headers={
+            "Authorization": f"Zoho-enczapikey {os.environ['ZEPTOMAIL_TOKEN']}",
+            "Content-Type": "application/json",
+        },
+        timeout=15,
     )
-    msg.attach(MIMEText(body, "plain"))
-
-    attachment = MIMEApplication(pdf_bytes, _subtype="pdf")
-    attachment.add_header("Content-Disposition", "attachment", filename="informe-trust.pdf")
-    msg.attach(attachment)
-
-    with smtplib.SMTP_SSL(os.environ["ZOHO_SMTP_HOST"], 465) as server:
-        server.login(os.environ["ZOHO_EMAIL"], os.environ["ZOHO_APP_PASSWORD"])
-        server.send_message(msg)
+    response.raise_for_status()
