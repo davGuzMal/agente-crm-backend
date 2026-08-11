@@ -48,21 +48,13 @@ def send_report_email(to_email: str, pdf_bytes: bytes) -> None:
                   ("Invalid value format", "Unauthorized", etc.).
         httpx.RequestError si hay un problema de red.
     """
-    # --- DIAGNÓSTICO TEMPORAL (11/08/2026) — quitar en cuanto se resuelva el 500 ---
+    # --- DIAGNÓSTICO TEMPORAL v2 (11/08/2026) — comparar petición exacta ---
     token = os.environ["ZEPTOMAIL_TOKEN"]
     api_url = os.environ["ZEPTOMAIL_API_URL"]
-    from_email = os.environ["ZEPTOMAIL_FROM_EMAIL"]
-    print(
-        f"[DIAG] TOKEN len={len(token)} starts='{token[:2]}' ends='{token[-2:]}' "
-        f"tiene_espacios_extra={token != token.strip()}"
-    )
-    print(f"[DIAG] API_URL='{api_url}' tiene_espacios_extra={api_url != api_url.strip()}")
-    print(f"[DIAG] FROM_EMAIL='{from_email}' tiene_espacios_extra={from_email != from_email.strip()}")
-    # --- FIN DIAGNÓSTICO ---
 
     pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
 
-    payload = {
+    payload = {  # sin cambios
         "from": {
             "address": os.environ["ZEPTOMAIL_FROM_EMAIL"],
             "name": "Trust",
@@ -83,17 +75,24 @@ def send_report_email(to_email: str, pdf_bytes: bytes) -> None:
         ],
     }
 
-    api_url = os.environ["ZEPTOMAIL_API_URL"]
-
-    response = httpx.post(
+    request = httpx.Request(
+        "POST",
         f"{api_url}/v1.1/email",
         json=payload,
         headers={
-            "Authorization": f"Zoho-enczapikey {os.environ['ZEPTOMAIL_TOKEN']}",
+            "Authorization": f"Zoho-enczapikey {token}",
             "Content-Type": "application/json",
         },
-        timeout=15,
     )
+    print(f"[DIAG] Headers exactos: {dict(request.headers)}")
+    print(f"[DIAG] Body length: {len(request.content)} bytes")
+    print(f"[DIAG] Body primeros 300 bytes: {request.content[:300]}")
+    with httpx.Client(timeout=15) as client:
+        response = client.send(request)
+    print(f"[DIAG] Response headers: {dict(response.headers)}")
+    print(f"[DIAG] Response body completo: {response.text}")
+    # --- FIN DIAGNÓSTICO ---
+
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as e:
