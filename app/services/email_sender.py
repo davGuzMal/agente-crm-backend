@@ -25,12 +25,9 @@ Detalles a tener en cuenta si alguien edita este archivo:
   problema).
 """
 import base64
-import logging
 import os
 
 import httpx
-
-logger = logging.getLogger(__name__)
 
 
 def send_report_email(to_email: str, pdf_bytes: bytes) -> None:
@@ -51,6 +48,18 @@ def send_report_email(to_email: str, pdf_bytes: bytes) -> None:
                   ("Invalid value format", "Unauthorized", etc.).
         httpx.RequestError si hay un problema de red.
     """
+    # --- DIAGNÓSTICO TEMPORAL (11/08/2026) — quitar en cuanto se resuelva el 500 ---
+    token = os.environ["ZEPTOMAIL_TOKEN"]
+    api_url = os.environ["ZEPTOMAIL_API_URL"]
+    from_email = os.environ["ZEPTOMAIL_FROM_EMAIL"]
+    print(
+        f"[DIAG] TOKEN len={len(token)} starts='{token[:2]}' ends='{token[-2:]}' "
+        f"tiene_espacios_extra={token != token.strip()}"
+    )
+    print(f"[DIAG] API_URL='{api_url}' tiene_espacios_extra={api_url != api_url.strip()}")
+    print(f"[DIAG] FROM_EMAIL='{from_email}' tiene_espacios_extra={from_email != from_email.strip()}")
+    # --- FIN DIAGNÓSTICO ---
+
     pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
 
     payload = {
@@ -75,23 +84,6 @@ def send_report_email(to_email: str, pdf_bytes: bytes) -> None:
     }
 
     api_url = os.environ["ZEPTOMAIL_API_URL"]
-
-    # ─── DIAGNOSTICO TEMPORAL — comparar token visto por Render vs ZeptoMail ──
-    # SPRINT-BE-004 / diagnóstico 500: imprime solo longitud + máscara
-    # (2 primeros + 2 últimos chars). BORRAR después de confirmar que
-    # el token coincide con el del dashboard de ZeptoMail.
-    _token = os.environ.get("ZEPTOMAIL_TOKEN", "")
-    _masked = (
-        f"{_token[:2]}****{_token[-2:]}" if len(_token) >= 4 else "<too-short>"
-    )
-    logger.warning(
-        "[ZEPTOMAIL_TOKEN] len=%d masked=%s api_url=%s from=%s",
-        len(_token),
-        _masked,
-        api_url,
-        os.environ.get("ZEPTOMAIL_FROM_EMAIL", "<missing>"),
-    )
-    # ─── FIN DIAGNOSTICO TEMPORAL ─────────────────────────────────────────────
 
     response = httpx.post(
         f"{api_url}/v1.1/email",
