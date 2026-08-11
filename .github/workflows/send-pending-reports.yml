@@ -1,0 +1,19 @@
+name: Enviar informes pendientes
+
+on:
+  schedule:
+    # 08:00 UTC todos los días. Render está en UTC por defecto; los
+    # usuarios europeos lo reciben entre las 9 y las 10 de la mañana
+    # local (España CEST, UK BST, etc.).
+    - cron: '0 8 * * *'
+  workflow_dispatch:  # permite lanzarlo a mano desde GitHub también
+
+jobs:
+  send-reports:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Llamar al endpoint interno
+        run: |
+          curl -X POST "${{ secrets.BACKEND_URL }}/api/internal/send-pending-reports" \
+            -H "X-Cron-Secret: ${{ secrets.INTERNAL_CRON_SECRET }}" \
+            --fail

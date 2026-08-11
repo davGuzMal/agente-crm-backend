@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routers import evaluate
+from app.routers import evaluate, internal
 import logging
 logging.basicConfig(
     level=logging.INFO,
@@ -29,6 +29,7 @@ app.add_middleware(
 )
 
 app.include_router(evaluate.router, prefix="/api")
+app.include_router(internal.router)
 
 
 @app.get("/health")
