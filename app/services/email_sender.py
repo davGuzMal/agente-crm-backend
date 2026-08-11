@@ -71,8 +71,9 @@ def send_report_email(to_email: str, pdf_bytes: bytes) -> None:
         ],
     }
 
+    api_url = os.environ["ZEPTOMAIL_API_URL"]
     response = httpx.post(
-        f"{os.environ['ZEPTOMAIL_API_URL']}/v1.1/email",
+        f"{api_url}/v1.1/email",
         json=payload,
         headers={
             "Authorization": f"Zoho-enczapikey {os.environ['ZEPTOMAIL_TOKEN']}",
@@ -80,4 +81,15 @@ def send_report_email(to_email: str, pdf_bytes: bytes) -> None:
         },
         timeout=15,
     )
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        # Re-raise con el cuerpo completo de la respuesta. ZeptoMail incluye
+        # ahí el código de error específico, el campo que falló y un
+        # mensaje legible — raise_for_status() por defecto solo guarda el
+        # código de estado, dejando "Server error '500' for url..." que
+        # no deja diagnosticar. Sin este RuntimeError, los logs de Render
+        # no muestran la causa real.
+        raise RuntimeError(
+            f"ZeptoMail respondió {e.response.status_code}: {e.response.text}"
+        ) from e
