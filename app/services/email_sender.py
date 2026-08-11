@@ -48,13 +48,9 @@ def send_report_email(to_email: str, pdf_bytes: bytes) -> None:
                   ("Invalid value format", "Unauthorized", etc.).
         httpx.RequestError si hay un problema de red.
     """
-    # --- DIAGNÓSTICO TEMPORAL v2 (11/08/2026) — comparar petición exacta ---
-    token = os.environ["ZEPTOMAIL_TOKEN"]
-    api_url = os.environ["ZEPTOMAIL_API_URL"]
-
     pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
 
-    payload = {  # sin cambios
+    payload = {
         "from": {
             "address": os.environ["ZEPTOMAIL_FROM_EMAIL"],
             "name": "Trust",
@@ -75,24 +71,16 @@ def send_report_email(to_email: str, pdf_bytes: bytes) -> None:
         ],
     }
 
-    request = httpx.Request(
-        "POST",
+    api_url = os.environ["ZEPTOMAIL_API_URL"]
+    response = httpx.post(
         f"{api_url}/v1.1/email",
         json=payload,
         headers={
-            "Authorization": f"Zoho-enczapikey {token}",
+            "Authorization": f"Zoho-enczapikey {os.environ['ZEPTOMAIL_TOKEN']}",
             "Content-Type": "application/json",
         },
+        timeout=15,
     )
-    print(f"[DIAG] Headers exactos: {dict(request.headers)}")
-    print(f"[DIAG] Body length: {len(request.content)} bytes")
-    print(f"[DIAG] Body primeros 300 bytes: {request.content[:300]}")
-    with httpx.Client(timeout=15) as client:
-        response = client.send(request)
-    print(f"[DIAG] Response headers: {dict(response.headers)}")
-    print(f"[DIAG] Response body completo: {response.text}")
-    # --- FIN DIAGNÓSTICO ---
-
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as e:
