@@ -160,10 +160,21 @@ def _persist_evaluation_session(
         "sections_completed":   sections_completed,
         "model":                "claude",
         "llm_error_code":       llm_error_code,
+        # SPRINT-BE-002 / CC-008: timestamp explícito en cada upsert para
+        # distinguir "primer veredicto" de "veredicto refinado".
+        # created_at NO se pisa — Postgres lo aplica en el INSERT original y
+        # el upsert lo preserva, dándonos duración real desde el primer veredicto.
+        "updated_at":           datetime.now(timezone.utc).isoformat(),
     }
     try:
         client = _get_client()
-        client.table("evaluation_sessions").insert(row).execute()
+        # SPRINT-BE-002 / CC-008: upsert en vez de insert. El usuario puede
+        # llamar /api/evaluate varias veces con el mismo session_id (ej. al
+        # refinar el perfil tras los pasos 2/5/6/7 opcionales de CC-002).
+        # Si hacíamos insert(), la segunda llamada fallaba con violación de PK.
+        client.table("evaluation_sessions").upsert(
+            row, on_conflict="session_id"
+        ).execute()
         logger.info(f"Sesión de evaluación persistida: {row['session_id']}")
     except Exception as exc:
         logger.error(f"No se pudo persistir la sesión de evaluación: {exc}")
@@ -412,6 +423,27 @@ async def upsert_pilot_contact(contact: PilotContact):
     payload técnico de la evaluación. session_id es la clave primaria de
     pilot_contacts, así que llamar este endpoint dos veces para la misma
     sesión actualiza el registro (upsert) en vez de duplicarlo.
+
+    ── Contrato público (CC-005 / FE-004) ────────────────────────────────────
+    Request:
+        POST /api/pilot-contacts
+        {
+          "session_id":     "<sessionId del informe (/informe/[sessionId])>",
+          "contacto_email": "usuario@empresa.com"
+        }
+
+    Responses:
+        200 {"session_id": "...", "saved_fields": ["contacto_email"]}
+        400 si no se manda ningún campo (salvo session_id).
+        404 si session_id no existe en evaluation_sessions (caso borde: el
+            usuario hace clic en "Guardar" antes de que _persist_evaluation_session
+            termine tras el SSE 'done'. Frontend debe manejarlo como reintento
+            o mensaje "inténtalo de nuevo en un segundo", no error fatal).
+        422 si contacto_email tiene formato inválido (válido desde SPRINT-BE-002).
+
+    El upsert permite llamar este endpoint varias veces con el mismo
+    session_id — la primera crea la fila, las siguientes actualizan los
+    campos enviados sin duplicar.
     """
     data = contact.model_dump(exclude={"session_id"}, exclude_none=True)
 

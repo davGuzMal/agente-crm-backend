@@ -11,7 +11,7 @@ exportarse o analizarse sin fricción de privacidad. Los datos de contacto
 son PII y deben poder gestionarse (o borrarse) de forma independiente.
 """
 
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from typing import Optional
 
 
@@ -26,7 +26,10 @@ class PilotContact(BaseModel):
 
     empresa_nombre: Optional[str] = None
     contacto_nombre: Optional[str] = None
-    contacto_email: Optional[str] = None
+    # SPRINT-BE-002 / CC-005: validación de formato. Antes recibíamos texto
+    # libre; al pasar a tráfico público sin fricción, queremos un 422 claro
+    # si el usuario teclea "no-es-un-email". Requiere email-validator.
+    contacto_email: Optional[EmailStr] = None
     contacto_telefono: Optional[str] = None
     notas: Optional[str] = None
     """Notas libres de seguimiento (ej. fecha de llamada, próximos pasos)."""
