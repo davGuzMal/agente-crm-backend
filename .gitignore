@@ -16,3 +16,9 @@ __pycache__/
 
 # Logs
 *.log
+
+# graphify — artefactos locales del skill, no son parte del proyecto
+# (HTML, JSON de extracción, cache AST, GRAPH_REPORT.md, etc.).
+# Se regeneran con /graphify en cualquier momento; no aportan valor
+# al repo público y solo ocupan espacio.
+graphify-out/
